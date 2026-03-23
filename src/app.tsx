@@ -20,12 +20,23 @@ type WhatsNewFeedItem = {
 };
 
 type PlaylistEntry = { name: string; uri: string; isOwnedBySelf?: boolean };
+type TrackFingerprint = {
+  uri: string;
+  name: string;
+  durationMs: number | null;
+};
+type TrackNameDurationMap = Map<string, Array<number | null>>;
+type TrackSnapshot = {
+  uriSet: Set<string>;
+  byNameDuration: TrackNameDurationMap;
+};
 
 const EXTENSION_NAME = "WhatsNew Auto Save";
 const POLL_INTERVAL_MS = 15 * 60 * 1000;
 const FEED_PAGE_SIZE = 50;
 const MAX_FEED_PAGES_SAFETY = 400;
 const MAX_EMPTY_FEED_PAGES = 2;
+const DURATION_TOLERANCE_MS = 5000;
 const PROCESSED_IDS_KEY = "whatsnew:processed-feed-ids";
 const ENABLED_KEY = "whatsnew:enabled";
 const VERBOSE_DEBUG_KEY = "whatsnew:verbose-debug";
@@ -110,10 +121,90 @@ function chunks<T>(input: T[], size: number): T[][] {
   return result;
 }
 
-async function getAllAlbumTrackUris(albumUri: string): Promise<string[]> {
+function normalizeTrackName(name: string): string {
+  let normalized = name.toLowerCase().trim();
+  normalized = normalized.replace(/\s*[\(\[].*?[\)\]]/g, "");
+  normalized = normalized.replace(
+    /\s*-\s*(remaster(ed)?(\s*\d{2,4})?|live|mono|stereo|single version|radio edit).*$/i,
+    "",
+  );
+  normalized = normalized.replace(/\s+/g, " ").trim();
+  return normalized;
+}
+
+function normalizeDuration(durationMs: number | undefined | null): number | null {
+  if (typeof durationMs === "number" && Number.isFinite(durationMs)) return durationMs;
+  return null;
+}
+
+function hasDurationMatch(
+  map: TrackNameDurationMap,
+  normalizedName: string,
+  duration: number | null,
+): boolean {
+  const durations = map.get(normalizedName);
+  if (!durations) return false;
+  for (const existingDuration of durations) {
+    if (existingDuration === null || duration === null) return true;
+    if (Math.abs(existingDuration - duration) <= DURATION_TOLERANCE_MS) return true;
+  }
+  return false;
+}
+
+function addDurationEntry(
+  map: TrackNameDurationMap,
+  normalizedName: string,
+  duration: number | null,
+): void {
+  const durations = map.get(normalizedName) ?? [];
+  durations.push(duration);
+  map.set(normalizedName, durations);
+}
+
+function buildSnapshot(tracks: TrackFingerprint[]): TrackSnapshot {
+  const uriSet = new Set<string>();
+  const byNameDuration: TrackNameDurationMap = new Map();
+  for (const track of tracks) {
+    uriSet.add(track.uri);
+    addDurationEntry(byNameDuration, normalizeTrackName(track.name), track.durationMs);
+  }
+  return { uriSet, byNameDuration };
+}
+
+function collectAddableTracks(
+  candidates: TrackFingerprint[],
+  existing: TrackSnapshot,
+): TrackFingerprint[] {
+  const pendingByNameDuration: TrackNameDurationMap = new Map();
+  const result: TrackFingerprint[] = [];
+
+  for (const track of candidates) {
+    if (!track.uri || !track.name) continue;
+    if (existing.uriSet.has(track.uri)) continue;
+
+    const normalizedName = normalizeTrackName(track.name);
+    if (hasDurationMatch(existing.byNameDuration, normalizedName, track.durationMs)) continue;
+    if (hasDurationMatch(pendingByNameDuration, normalizedName, track.durationMs)) continue;
+
+    addDurationEntry(pendingByNameDuration, normalizedName, track.durationMs);
+    result.push(track);
+  }
+
+  return result;
+}
+
+function addTracksToSnapshot(snapshot: TrackSnapshot, tracks: TrackFingerprint[]): void {
+  for (const track of tracks) {
+    snapshot.uriSet.add(track.uri);
+    addDurationEntry(snapshot.byNameDuration, normalizeTrackName(track.name), track.durationMs);
+  }
+}
+
+async function getAllAlbumTracks(albumUri: string): Promise<TrackFingerprint[]> {
   debug(`Loading album tracks: ${albumUri}`, false);
   const query = definitions.queryAlbumTracks;
-  const uris: string[] = [];
+  const tracks: TrackFingerprint[] = [];
+  const seenUris = new Set<string>();
   let offset = 0;
 
   while (true) {
@@ -129,14 +220,25 @@ async function getAllAlbumTrackUris(albumUri: string): Promise<string[]> {
 
     for (const item of items) {
       const track = item?.track ?? item;
-      if (typeof track?.uri === "string") uris.push(track.uri);
+      if (typeof track?.uri !== "string" || typeof track?.name !== "string") continue;
+      if (seenUris.has(track.uri)) continue;
+      seenUris.add(track.uri);
+
+      const durationMs = normalizeDuration(
+        track?.duration?.totalMilliseconds ?? track?.durationMs ?? track?.duration_ms,
+      );
+      tracks.push({
+        uri: track.uri,
+        name: track.name,
+        durationMs,
+      });
     }
 
     if (items.length < 100) break;
     offset += 100;
   }
 
-  return Array.from(new Set(uris));
+  return tracks;
 }
 
 async function likeTracks(trackUris: string[]): Promise<void> {
@@ -189,13 +291,26 @@ async function getAllMyPlaylists(): Promise<PlaylistEntry[]> {
   return playlists.filter((playlist) => playlist.isOwnedBySelf !== false);
 }
 
-async function getPlaylistTrackUriSet(playlistUri: string): Promise<Set<string>> {
+async function getPlaylistTracks(playlistUri: string): Promise<TrackFingerprint[]> {
   debug(`Reading playlist tracks for duplicate check: ${playlistUri}`, false);
   const contents = await Spicetify.Platform.PlaylistAPI.getContents(playlistUri, { limit: 9999999 });
-  const uris = (contents?.items ?? [])
-    .map((item: any) => item?.uri)
-    .filter((uri: unknown): uri is string => typeof uri === "string");
-  return new Set(uris);
+  const tracks: TrackFingerprint[] = [];
+  const seenUris = new Set<string>();
+
+  for (const item of contents?.items ?? []) {
+    const uri = item?.uri;
+    const name = item?.name;
+    if (typeof uri !== "string" || typeof name !== "string") continue;
+    if (seenUris.has(uri)) continue;
+    seenUris.add(uri);
+    tracks.push({
+      uri,
+      name,
+      durationMs: normalizeDuration(item?.duration_ms),
+    });
+  }
+
+  return tracks;
 }
 
 function parseContainsResponseToBoolArray(response: any, expectedLength: number): boolean[] {
@@ -227,6 +342,63 @@ async function getUnlikedTrackUris(trackUris: string[]): Promise<string[]> {
   return toAdd;
 }
 
+function extractTrackFingerprintFromLibraryItem(item: any): TrackFingerprint | null {
+  const uri = item?.uri ?? item?.track?.uri ?? item?.item?.uri;
+  const name = item?.name ?? item?.track?.name ?? item?.item?.name;
+  const durationMs = normalizeDuration(
+    item?.duration_ms ??
+      item?.durationMs ??
+      item?.track?.duration_ms ??
+      item?.track?.durationMs ??
+      item?.track?.duration?.totalMilliseconds ??
+      item?.item?.duration_ms,
+  );
+
+  if (typeof uri !== "string" || typeof name !== "string") return null;
+  return { uri, name, durationMs };
+}
+
+async function getLikedSongsSnapshot(): Promise<TrackSnapshot | null> {
+  const libraryApi = Spicetify.Platform?.LibraryAPI;
+  const getTracksMethod = libraryApi?.getTracks;
+  if (typeof getTracksMethod !== "function") {
+    debug("LibraryAPI.getTracks is unavailable; falling back to URI-only contains check", false);
+    return null;
+  }
+
+  try {
+    const collected: TrackFingerprint[] = [];
+    const seenUris = new Set<string>();
+    let offset = 0;
+    const pageSize = 200;
+
+    while (true) {
+      const response = await getTracksMethod({ offset, limit: pageSize });
+      const items = response?.items ?? response ?? [];
+      if (!Array.isArray(items) || items.length === 0) break;
+
+      let pageAdded = 0;
+      for (const item of items) {
+        const track = extractTrackFingerprintFromLibraryItem(item);
+        if (!track || seenUris.has(track.uri)) continue;
+        seenUris.add(track.uri);
+        collected.push(track);
+        pageAdded += 1;
+      }
+
+      debug(`Liked Songs snapshot page loaded: offset=${offset}, items=${items.length}, added=${pageAdded}`, false);
+      if (items.length < pageSize) break;
+      offset += pageSize;
+    }
+
+    debug(`Loaded Liked Songs snapshot via LibraryAPI: ${collected.length} track(s)`, false);
+    return buildSnapshot(collected);
+  } catch (error) {
+    debug(`LibraryAPI.getTracks failed, using URI-only contains fallback: ${String(error)}`, false);
+    return null;
+  }
+}
+
 function findMatchingPlaylists(playlists: PlaylistEntry[], artistNames: string[]): PlaylistEntry[] {
   const normalizedArtists = new Set(artistNames.map((name) => normalizeName(name)));
   return playlists.filter((playlist) => {
@@ -237,26 +409,26 @@ function findMatchingPlaylists(playlists: PlaylistEntry[], artistNames: string[]
 
 async function addTracksToPlaylistDeduped(
   playlistUri: string,
-  trackUris: string[],
-  existingUrisByPlaylist: Map<string, Set<string>>,
+  releaseTracks: TrackFingerprint[],
+  existingTracksByPlaylist: Map<string, TrackSnapshot>,
 ): Promise<number> {
-  let existingUris = existingUrisByPlaylist.get(playlistUri);
-  if (!existingUris) {
-    existingUris = await getPlaylistTrackUriSet(playlistUri);
-    existingUrisByPlaylist.set(playlistUri, existingUris);
+  let existingSnapshot = existingTracksByPlaylist.get(playlistUri);
+  if (!existingSnapshot) {
+    existingSnapshot = buildSnapshot(await getPlaylistTracks(playlistUri));
+    existingTracksByPlaylist.set(playlistUri, existingSnapshot);
   }
 
-  const uniqueUris = Array.from(new Set(trackUris));
-  const toAdd = uniqueUris.filter((uri) => !existingUris.has(uri));
-  if (toAdd.length === 0) {
+  const toAddTracks = collectAddableTracks(releaseTracks, existingSnapshot);
+  if (toAddTracks.length === 0) {
     debug(`Playlist already up to date: ${playlistUri}`, false);
     return 0;
   }
 
+  const toAdd = toAddTracks.map((track) => track.uri);
   for (const batch of chunks(toAdd, 100)) {
     await Spicetify.Platform.PlaylistAPI.add(playlistUri, batch, { after: "end" });
-    for (const uri of batch) existingUris.add(uri);
   }
+  addTracksToSnapshot(existingSnapshot, toAddTracks);
 
   debug(`Added ${toAdd.length} track(s) to playlist: ${playlistUri}`);
   return toAdd.length;
@@ -352,14 +524,18 @@ async function markFeedItemsSeen(feedItemIds: string[]): Promise<void> {
   }
 }
 
-async function runSync(): Promise<void> {
+async function runSync(options?: { force?: boolean }): Promise<void> {
+  const force = options?.force === true;
   if (isRunning) {
     debug("Sync skipped: previous sync still running");
     return;
   }
-  if (!getBoolSetting(ENABLED_KEY, true)) {
+  if (!force && !getBoolSetting(ENABLED_KEY, true)) {
     debug("Sync skipped: extension disabled", false);
     return;
+  }
+  if (force) {
+    debug("Force sync enabled: bypassing auto-save toggle", false);
   }
   isRunning = true;
 
@@ -373,19 +549,38 @@ async function runSync(): Promise<void> {
     debug(`Fetched ${feedItems.length} feed item(s)`);
 
     const processedFeedIds = getProcessedIds();
+    const bypassProcessedCache = force;
+    if (bypassProcessedCache) {
+      debug("Force sync enabled: bypassing processed-items cache", false);
+    }
     const myPlaylists = await getAllMyPlaylists();
     debug(`Found ${myPlaylists.length} owned playlist(s)`);
-    const existingUrisByPlaylist = new Map<string, Set<string>>();
+    const existingTracksByPlaylist = new Map<string, TrackSnapshot>();
+    const likedSongsSnapshot = await getLikedSongsSnapshot();
     const feedIdsToMarkSeen: string[] = [];
     let releasesHandled = 0;
     let tracksHandled = 0;
+    let skippedProcessed = 0;
+    let skippedNonAlbum = 0;
+    let skippedInvalidAlbum = 0;
+    let skippedNoArtists = 0;
 
     for (const item of feedItems) {
-      if (!item.id || processedFeedIds.has(item.id)) continue;
-      if (item.content?.__typename !== "AlbumResponseWrapper") continue;
+      if (!item.id) continue;
+      if (!bypassProcessedCache && processedFeedIds.has(item.id)) {
+        skippedProcessed += 1;
+        continue;
+      }
+      if (item.content?.__typename !== "AlbumResponseWrapper") {
+        skippedNonAlbum += 1;
+        continue;
+      }
 
       const album = item.content.data;
-      if (!album || album.__typename !== "Album" || !album.uri) continue;
+      if (!album || album.__typename !== "Album" || !album.uri) {
+        skippedInvalidAlbum += 1;
+        continue;
+      }
 
       const artistItems = album.artists?.items ?? [];
       const artistData = artistItems
@@ -395,21 +590,24 @@ async function runSync(): Promise<void> {
         })
         .filter((artist): artist is { artistUri: string; artistName: string } => Boolean(artist));
 
-      if (artistData.length === 0) continue;
+      if (artistData.length === 0) {
+        skippedNoArtists += 1;
+        continue;
+      }
 
       try {
         debug(`Processing release: ${album.name ?? album.uri}`);
         if (item.state?.state) {
           debug(`Feed item state is "${item.state.state}" (processing anyway)`, false);
         }
-        const trackUris = await getAllAlbumTrackUris(album.uri);
-        if (trackUris.length === 0) {
+        const releaseTracks = await getAllAlbumTracks(album.uri);
+        if (releaseTracks.length === 0) {
           debug("Release has no tracks, marking as processed");
           processedFeedIds.add(item.id);
           feedIdsToMarkSeen.push(item.id);
           continue;
         }
-        debug(`Release track count: ${trackUris.length}`);
+        debug(`Release track count: ${releaseTracks.length}`);
 
         const releaseArtistNames = artistData.map((artist) => artist.artistName);
         const matchingPlaylists = findMatchingPlaylists(myPlaylists, releaseArtistNames);
@@ -417,15 +615,26 @@ async function runSync(): Promise<void> {
           `Artist(s): ${releaseArtistNames.join(", ")} | Matching playlist(s): ${matchingPlaylists.map((p) => p.name).join(" | ") || "none"}`,
         );
 
-        const likedToAdd = await getUnlikedTrackUris(trackUris);
-        if (likedToAdd.length > 0) {
-          await likeTracks(likedToAdd);
+        let likedToAddUris: string[] = [];
+        if (likedSongsSnapshot) {
+          const likedToAddTracks = collectAddableTracks(releaseTracks, likedSongsSnapshot);
+          likedToAddUris = likedToAddTracks.map((track) => track.uri);
+          if (likedToAddTracks.length > 0) {
+            await likeTracks(likedToAddUris);
+            addTracksToSnapshot(likedSongsSnapshot, likedToAddTracks);
+          }
         } else {
-          debug("All release tracks already in Liked Songs");
+          likedToAddUris = await getUnlikedTrackUris(releaseTracks.map((track) => track.uri));
+          if (likedToAddUris.length > 0) {
+            await likeTracks(likedToAddUris);
+          }
+        }
+        if (likedToAddUris.length === 0) {
+          debug("All release tracks already in Liked Songs (or equivalent duplicates)");
         }
 
         for (const playlist of matchingPlaylists) {
-          await addTracksToPlaylistDeduped(playlist.uri, trackUris, existingUrisByPlaylist);
+          await addTracksToPlaylistDeduped(playlist.uri, releaseTracks, existingTracksByPlaylist);
         }
         if (matchingPlaylists.length === 0) {
           debug("No matching playlists for this release; only updated Liked Songs", false);
@@ -434,7 +643,7 @@ async function runSync(): Promise<void> {
         processedFeedIds.add(item.id);
         feedIdsToMarkSeen.push(item.id);
         releasesHandled += 1;
-        tracksHandled += likedToAdd.length;
+        tracksHandled += likedToAddUris.length;
       } catch (error) {
         console.error(`${EXTENSION_NAME}: failed processing release`, {
           itemId: item.id,
@@ -446,6 +655,10 @@ async function runSync(): Promise<void> {
 
     await markFeedItemsSeen(feedIdsToMarkSeen);
     setProcessedIds(processedFeedIds);
+    debug(
+      `Skip summary: processed=${skippedProcessed}, nonAlbum=${skippedNonAlbum}, invalidAlbum=${skippedInvalidAlbum}, noArtists=${skippedNoArtists}`,
+      false,
+    );
 
     if (releasesHandled > 0) {
       notify(`Added ${tracksHandled} new tracks to Liked Songs from ${releasesHandled} releases.`);
@@ -514,7 +727,7 @@ function registerTopbarButton(): void {
     SYNC_ICON,
     () => {
       debug("Manual sync triggered");
-      void runSync();
+      void runSync({ force: true });
     },
     false,
     true,
