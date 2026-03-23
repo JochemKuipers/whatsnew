@@ -27,16 +27,40 @@ const FEED_PAGE_SIZE = 50;
 const MAX_FEED_PAGES = 4;
 const PROCESSED_IDS_KEY = "whatsnew:processed-feed-ids";
 const ENABLED_KEY = "whatsnew:enabled";
+const VERBOSE_DEBUG_KEY = "whatsnew:verbose-debug";
+const VERBOSE_DEBUG_DEFAULT = true;
+const SYNC_ICON =
+  '<svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M13.2 4.3a5.8 5.8 0 0 0-9.9 1.6H1.7a.7.7 0 1 0 0 1.4h2.3c.4 0 .7-.3.7-.7V4.2a.7.7 0 1 0-1.4 0v.8A7.2 7.2 0 0 1 15.2 8a.7.7 0 1 0 1.4 0c0-1.4-.4-2.7-1.2-3.7h.8a.7.7 0 0 0 0-1.4h-2.3c-.4 0-.7.3-.7.7v2.3a.7.7 0 1 0 1.4 0v-.6ZM1.4 8a.7.7 0 0 0-1.4 0c0 1.4.4 2.7 1.2 3.7H.4a.7.7 0 1 0 0 1.4h2.3c.4 0 .7-.3.7-.7v-2.3a.7.7 0 1 0-1.4 0v.6A5.8 5.8 0 0 0 11.9 9h1.6a.7.7 0 1 0 0-1.4h-2.3c-.4 0-.7.3-.7.7v2.3a.7.7 0 1 0 1.4 0v-.8A7.2 7.2 0 0 1 1.4 8Z" fill="currentColor"/></svg>';
 
 let menuItem: Spicetify.Menu.Item | null = null;
 let timerId: number | null = null;
 let isRunning = false;
+let topbarButton: Spicetify.Topbar.Button | null = null;
 
 const spotifyGraphQL = Spicetify.GraphQL;
 const definitions = spotifyGraphQL.Definitions;
 
 function notify(message: string, isError = false): void {
   Spicetify.showNotification(`${EXTENSION_NAME}: ${message}`, isError, 5000);
+}
+
+function debug(message: string, toast = true): void {
+  // Always log to console; optional toast for high visibility.
+  console.log(`[${EXTENSION_NAME}] ${message}`);
+  if (toast && getBoolSetting(VERBOSE_DEBUG_KEY, VERBOSE_DEBUG_DEFAULT)) {
+    Spicetify.showNotification(`${EXTENSION_NAME}: ${message}`, false, 2500);
+  }
+}
+
+function setMenuItemLabelSafe(item: Spicetify.Menu.Item, label: string): void {
+  const maybeSetName = (item as unknown as { setName?: (name: string) => void }).setName;
+  if (typeof maybeSetName === "function") {
+    maybeSetName(label);
+    return;
+  }
+
+  // Runtime compatibility fallback for clients where setName is missing.
+  (item as unknown as { name?: string }).name = label;
 }
 
 function getBoolSetting(key: string, fallback = true): boolean {
@@ -81,6 +105,7 @@ function chunks<T>(input: T[], size: number): T[][] {
 }
 
 async function getAllAlbumTrackUris(albumUri: string): Promise<string[]> {
+  debug(`Loading album tracks: ${albumUri}`, false);
   const query = definitions.queryAlbumTracks;
   const uris: string[] = [];
   let offset = 0;
@@ -108,6 +133,7 @@ async function getAllAlbumTrackUris(albumUri: string): Promise<string[]> {
 }
 
 async function likeTracks(trackUris: string[]): Promise<void> {
+  debug(`Adding ${trackUris.length} track(s) to Liked Songs`);
   for (const batch of chunks(trackUris, 50)) {
     await Spicetify.Platform.LibraryAPI.add({ uris: batch });
   }
@@ -145,6 +171,7 @@ function collectPlaylists(items: any[], result: PlaylistEntry[]): void {
 }
 
 async function getAllMyPlaylists(): Promise<PlaylistEntry[]> {
+  debug("Reading your playlists from rootlist", false);
   const rootlist = await Spicetify.Platform.RootlistAPI.getContents({ limit: 50000 });
   const playlists: PlaylistEntry[] = [];
 
@@ -156,6 +183,7 @@ async function getAllMyPlaylists(): Promise<PlaylistEntry[]> {
 }
 
 async function getPlaylistTrackUriSet(playlistUri: string): Promise<Set<string>> {
+  debug(`Reading playlist tracks for duplicate check: ${playlistUri}`, false);
   const contents = await Spicetify.Platform.PlaylistAPI.getContents(playlistUri, { limit: 9999999 });
   const uris = (contents?.items ?? [])
     .map((item: any) => item?.uri)
@@ -183,10 +211,12 @@ async function getUnlikedTrackUris(trackUris: string[]): Promise<string[]> {
       }
     } catch {
       // Fallback when contains API is unavailable: let add endpoint dedupe server-side.
+      debug("Library contains-check unavailable, falling back to direct add dedupe", false);
       toAdd.push(...batch);
     }
   }
 
+  debug(`Liked Songs dedupe: ${trackUris.length} candidate(s), ${toAdd.length} new`);
   return toAdd;
 }
 
@@ -211,13 +241,17 @@ async function addTracksToPlaylistDeduped(
 
   const uniqueUris = Array.from(new Set(trackUris));
   const toAdd = uniqueUris.filter((uri) => !existingUris.has(uri));
-  if (toAdd.length === 0) return 0;
+  if (toAdd.length === 0) {
+    debug(`Playlist already up to date: ${playlistUri}`, false);
+    return 0;
+  }
 
   for (const batch of chunks(toAdd, 100)) {
     await Spicetify.Platform.PlaylistAPI.add(playlistUri, batch, { after: "end" });
     for (const uri of batch) existingUris.add(uri);
   }
 
+  debug(`Added ${toAdd.length} track(s) to playlist: ${playlistUri}`);
   return toAdd.length;
 }
 
@@ -226,6 +260,7 @@ async function queryWhatsNewFeedItems(): Promise<WhatsNewFeedItem[]> {
   let offset = 0;
 
   for (let page = 0; page < MAX_FEED_PAGES; page += 1) {
+    debug(`Querying Whats New page ${page + 1} (offset ${offset})`, false);
     const response = await spotifyGraphQL.Request(definitions.queryWhatsNewFeed, {
       offset,
       limit: FEED_PAGE_SIZE,
@@ -244,6 +279,7 @@ async function queryWhatsNewFeedItems(): Promise<WhatsNewFeedItem[]> {
 
 async function markFeedItemsSeen(feedItemIds: string[]): Promise<void> {
   if (feedItemIds.length === 0) return;
+  debug(`Marking ${feedItemIds.length} feed item(s) as SEEN`);
 
   for (const batch of chunks(feedItemIds, 50)) {
     await spotifyGraphQL.Request(definitions.SetItemsStateInWhatsNewFeed, {
@@ -258,16 +294,28 @@ async function markFeedItemsSeen(feedItemIds: string[]): Promise<void> {
 }
 
 async function runSync(): Promise<void> {
-  if (isRunning) return;
-  if (!getBoolSetting(ENABLED_KEY, true)) return;
+  if (isRunning) {
+    debug("Sync skipped: previous sync still running");
+    return;
+  }
+  if (!getBoolSetting(ENABLED_KEY, true)) {
+    debug("Sync skipped: extension disabled", false);
+    return;
+  }
   isRunning = true;
 
   try {
+    debug("Starting sync");
     const feedItems = await queryWhatsNewFeedItems();
-    if (feedItems.length === 0) return;
+    if (feedItems.length === 0) {
+      debug("No feed items returned");
+      return;
+    }
+    debug(`Fetched ${feedItems.length} feed item(s)`);
 
     const processedFeedIds = getProcessedIds();
     const myPlaylists = await getAllMyPlaylists();
+    debug(`Found ${myPlaylists.length} owned playlist(s)`);
     const existingUrisByPlaylist = new Map<string, Set<string>>();
     const feedIdsToMarkSeen: string[] = [];
     let releasesHandled = 0;
@@ -292,23 +340,34 @@ async function runSync(): Promise<void> {
       if (artistData.length === 0) continue;
 
       try {
+        debug(`Processing release: ${album.name ?? album.uri}`);
         const trackUris = await getAllAlbumTrackUris(album.uri);
         if (trackUris.length === 0) {
+          debug("Release has no tracks, marking as processed");
           processedFeedIds.add(item.id);
           feedIdsToMarkSeen.push(item.id);
           continue;
         }
+        debug(`Release track count: ${trackUris.length}`);
 
         const releaseArtistNames = artistData.map((artist) => artist.artistName);
         const matchingPlaylists = findMatchingPlaylists(myPlaylists, releaseArtistNames);
+        debug(
+          `Artist(s): ${releaseArtistNames.join(", ")} | Matching playlist(s): ${matchingPlaylists.map((p) => p.name).join(" | ") || "none"}`,
+        );
 
         const likedToAdd = await getUnlikedTrackUris(trackUris);
         if (likedToAdd.length > 0) {
           await likeTracks(likedToAdd);
+        } else {
+          debug("All release tracks already in Liked Songs");
         }
 
         for (const playlist of matchingPlaylists) {
           await addTracksToPlaylistDeduped(playlist.uri, trackUris, existingUrisByPlaylist);
+        }
+        if (matchingPlaylists.length === 0) {
+          debug("No matching playlists for this release; only updated Liked Songs", false);
         }
 
         processedFeedIds.add(item.id);
@@ -329,6 +388,9 @@ async function runSync(): Promise<void> {
 
     if (releasesHandled > 0) {
       notify(`Added ${tracksHandled} new tracks to Liked Songs from ${releasesHandled} releases.`);
+      debug("Sync completed successfully");
+    } else {
+      debug("Sync completed: nothing new to process");
     }
   } catch (error) {
     console.error(`${EXTENSION_NAME}: sync failed`, error);
@@ -342,7 +404,7 @@ function updateMenuState(): void {
   const enabled = getBoolSetting(ENABLED_KEY, true);
   if (menuItem) {
     menuItem.isEnabled = enabled;
-    menuItem.setName(`${EXTENSION_NAME} (${enabled ? "ON" : "OFF"})`);
+    setMenuItemLabelSafe(menuItem, `${EXTENSION_NAME} (${enabled ? "ON" : "OFF"})`);
   }
 }
 
@@ -356,6 +418,15 @@ function setupMenu(): void {
     notify(next ? "Enabled" : "Disabled");
   });
   menuItem.register();
+
+  const verboseDebug = getBoolSetting(VERBOSE_DEBUG_KEY, VERBOSE_DEBUG_DEFAULT);
+  new Spicetify.Menu.Item(`Verbose Debug (${verboseDebug ? "ON" : "OFF"})`, verboseDebug, (self) => {
+    const next = !self.isEnabled;
+    self.isEnabled = next;
+    setBoolSetting(VERBOSE_DEBUG_KEY, next);
+    setMenuItemLabelSafe(self, `Verbose Debug (${next ? "ON" : "OFF"})`);
+    notify(next ? "Verbose debug enabled" : "Verbose debug disabled");
+  }).register();
 }
 
 function startScheduler(): void {
@@ -365,20 +436,44 @@ function startScheduler(): void {
   }, POLL_INTERVAL_MS);
 }
 
+function registerTopbarButton(): void {
+  if (!Spicetify?.Topbar?.Button) {
+    window.setTimeout(registerTopbarButton, 500);
+    return;
+  }
+
+  if (topbarButton) {
+    topbarButton.element?.remove();
+    topbarButton = null;
+  }
+
+  // Pattern similar to Lucid: construct the button directly when Topbar is ready.
+  topbarButton = new Spicetify.Topbar.Button(
+    "WN Sync",
+    SYNC_ICON,
+    () => {
+      debug("Manual sync triggered");
+      void runSync();
+    },
+    false,
+    true,
+  );
+  debug("Topbar sync button registered", false);
+}
+
 function initialize(): void {
   if (Spicetify.LocalStorage.get(ENABLED_KEY) === null) {
     setBoolSetting(ENABLED_KEY, true);
+  }
+  if (Spicetify.LocalStorage.get(VERBOSE_DEBUG_KEY) === null) {
+    setBoolSetting(VERBOSE_DEBUG_KEY, VERBOSE_DEBUG_DEFAULT);
   }
 
   setupMenu();
   updateMenuState();
   startScheduler();
+  registerTopbarButton();
   void runSync();
-
-  // Quick-access command for manual runs.
-  new Spicetify.Topbar.Button("WN Sync", "refresh", () => {
-    void runSync();
-  });
 }
 
 function waitForSpicetify(): void {
