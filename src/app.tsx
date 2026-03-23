@@ -24,7 +24,8 @@ type PlaylistEntry = { name: string; uri: string; isOwnedBySelf?: boolean };
 const EXTENSION_NAME = "WhatsNew Auto Save";
 const POLL_INTERVAL_MS = 15 * 60 * 1000;
 const FEED_PAGE_SIZE = 50;
-const MAX_FEED_PAGES = 4;
+const MAX_FEED_PAGES_SAFETY = 400;
+const MAX_EMPTY_FEED_PAGES = 2;
 const PROCESSED_IDS_KEY = "whatsnew:processed-feed-ids";
 const ENABLED_KEY = "whatsnew:enabled";
 const VERBOSE_DEBUG_KEY = "whatsnew:verbose-debug";
@@ -50,6 +51,11 @@ function debug(message: string, toast = true): void {
   if (toast && getBoolSetting(VERBOSE_DEBUG_KEY, VERBOSE_DEBUG_DEFAULT)) {
     Spicetify.showNotification(`${EXTENSION_NAME}: ${message}`, false, 2500);
   }
+}
+
+function debugResponse(label: string, payload: unknown): void {
+  if (!getBoolSetting(VERBOSE_DEBUG_KEY, VERBOSE_DEBUG_DEFAULT)) return;
+  console.log(`[${EXTENSION_NAME}] ${label}`, payload);
 }
 
 function setMenuItemLabelSafe(item: Spicetify.Menu.Item, label: string): void {
@@ -116,6 +122,7 @@ async function getAllAlbumTrackUris(albumUri: string): Promise<string[]> {
       offset,
       limit: 100,
     });
+    debugResponse(`GraphQL queryAlbumTracks response (album=${albumUri}, offset=${offset})`, response);
 
     const items = response?.data?.albumUnion?.tracksV2?.items ?? response?.data?.albumUnion?.tracks?.items ?? [];
     if (!items || items.length === 0) break;
@@ -257,9 +264,19 @@ async function addTracksToPlaylistDeduped(
 
 async function queryWhatsNewFeedItems(): Promise<WhatsNewFeedItem[]> {
   const allItems: WhatsNewFeedItem[] = [];
+  const seenFeedItemIds = new Set<string>();
   let offset = 0;
+  let page = 0;
+  let consecutiveEmptyPages = 0;
+  const seenOffsets = new Set<number>();
 
-  for (let page = 0; page < MAX_FEED_PAGES; page += 1) {
+  while (page < MAX_FEED_PAGES_SAFETY) {
+    if (seenOffsets.has(offset)) {
+      debug(`Stopping feed pagination: offset loop detected at ${offset}`, false);
+      break;
+    }
+    seenOffsets.add(offset);
+
     debug(`Querying Whats New page ${page + 1} (offset ${offset})`, false);
     const response = await spotifyGraphQL.Request(definitions.queryWhatsNewFeed, {
       offset,
@@ -267,11 +284,52 @@ async function queryWhatsNewFeedItems(): Promise<WhatsNewFeedItem[]> {
       onlyUnPlayedItems: false,
       includedContentTypes: [],
     });
+    debugResponse(`GraphQL queryWhatsNewFeed response (page=${page + 1}, offset=${offset})`, response);
 
-    const items = (response?.data?.whatsNewFeedItems?.items ?? []) as WhatsNewFeedItem[];
-    allItems.push(...items);
-    if (items.length < FEED_PAGE_SIZE) break;
-    offset += FEED_PAGE_SIZE;
+    const feed = response?.data?.whatsNewFeedItems;
+    const items = (feed?.items ?? []) as WhatsNewFeedItem[];
+    for (const item of items) {
+      if (!item?.id || seenFeedItemIds.has(item.id)) continue;
+      seenFeedItemIds.add(item.id);
+      allItems.push(item);
+    }
+    const nextOffset = feed?.pagingInfo?.nextOffset;
+    const totalCount = feed?.totalCount;
+    const hasExplicitNextOffset = typeof nextOffset === "number" && Number.isFinite(nextOffset);
+    const computedNextOffset = offset + FEED_PAGE_SIZE;
+    const canFallbackBySize = items.length > 0;
+    const fallbackNextOffset = canFallbackBySize ? computedNextOffset : null;
+
+    debug(
+      `Feed page ${page + 1}: received ${items.length} item(s), accumulated ${allItems.length}${typeof totalCount === "number" ? ` / total ${totalCount}` : ""}, nextOffset=${String(nextOffset)}, fallbackNextOffset=${String(fallbackNextOffset)}`,
+      false,
+    );
+
+    if (items.length === 0) {
+      consecutiveEmptyPages += 1;
+      debug(`Feed page empty (${consecutiveEmptyPages}/${MAX_EMPTY_FEED_PAGES})`, false);
+      if (consecutiveEmptyPages >= MAX_EMPTY_FEED_PAGES) {
+        debug("Stopping feed pagination: repeated empty pages", false);
+        break;
+      }
+    } else {
+      consecutiveEmptyPages = 0;
+    }
+
+    // Some clients report totalCount/nextOffset capped (e.g. 150) even when older pages are still queryable.
+    // Prefer explicit nextOffset when available, otherwise probe by offset+limit.
+    const next = hasExplicitNextOffset ? nextOffset : fallbackNextOffset;
+    if (typeof next !== "number" || !Number.isFinite(next) || next <= offset) {
+      debug("Stopping feed pagination: no valid next offset provided by API", false);
+      break;
+    }
+
+    offset = next;
+    page += 1;
+  }
+
+  if (page >= MAX_FEED_PAGES_SAFETY) {
+    debug(`Stopped feed pagination at safety cap (${MAX_FEED_PAGES_SAFETY} pages)`, false);
   }
 
   return allItems;
@@ -282,7 +340,7 @@ async function markFeedItemsSeen(feedItemIds: string[]): Promise<void> {
   debug(`Marking ${feedItemIds.length} feed item(s) as SEEN`);
 
   for (const batch of chunks(feedItemIds, 50)) {
-    await spotifyGraphQL.Request(definitions.SetItemsStateInWhatsNewFeed, {
+    const response = await spotifyGraphQL.Request(definitions.SetItemsStateInWhatsNewFeed, {
       items: {
         items: batch.map((id) => ({
           id,
@@ -290,6 +348,7 @@ async function markFeedItemsSeen(feedItemIds: string[]): Promise<void> {
         })),
       },
     });
+    debugResponse(`GraphQL SetItemsStateInWhatsNewFeed response (batch=${batch.length})`, response);
   }
 }
 
@@ -323,7 +382,6 @@ async function runSync(): Promise<void> {
 
     for (const item of feedItems) {
       if (!item.id || processedFeedIds.has(item.id)) continue;
-      if (item.state?.state === "SEEN") continue;
       if (item.content?.__typename !== "AlbumResponseWrapper") continue;
 
       const album = item.content.data;
@@ -341,6 +399,9 @@ async function runSync(): Promise<void> {
 
       try {
         debug(`Processing release: ${album.name ?? album.uri}`);
+        if (item.state?.state) {
+          debug(`Feed item state is "${item.state.state}" (processing anyway)`, false);
+        }
         const trackUris = await getAllAlbumTrackUris(album.uri);
         if (trackUris.length === 0) {
           debug("Release has no tracks, marking as processed");
