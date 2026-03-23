@@ -42,7 +42,7 @@ const ENABLED_KEY = "whatsnew:enabled";
 const VERBOSE_DEBUG_KEY = "whatsnew:verbose-debug";
 const VERBOSE_DEBUG_DEFAULT = true;
 const SYNC_ICON =
-  '<svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M13.2 4.3a5.8 5.8 0 0 0-9.9 1.6H1.7a.7.7 0 1 0 0 1.4h2.3c.4 0 .7-.3.7-.7V4.2a.7.7 0 1 0-1.4 0v.8A7.2 7.2 0 0 1 15.2 8a.7.7 0 1 0 1.4 0c0-1.4-.4-2.7-1.2-3.7h.8a.7.7 0 0 0 0-1.4h-2.3c-.4 0-.7.3-.7.7v2.3a.7.7 0 1 0 1.4 0v-.6ZM1.4 8a.7.7 0 0 0-1.4 0c0 1.4.4 2.7 1.2 3.7H.4a.7.7 0 1 0 0 1.4h2.3c.4 0 .7-.3.7-.7v-2.3a.7.7 0 1 0-1.4 0v.6A5.8 5.8 0 0 0 11.9 9h1.6a.7.7 0 1 0 0-1.4h-2.3c-.4 0-.7.3-.7.7v2.3a.7.7 0 1 0 1.4 0v-.8A7.2 7.2 0 0 1 1.4 8Z" fill="currentColor"/></svg>';
+  '<svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M13 8a5 5 0 0 0-8.66-3.54" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/><path stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" d="M4 2v3h3M3 8a5 5 0 0 0 8.66 3.54"/><path stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" d="M12 14v-3H9"/></svg>';
 
 let menuItem: Spicetify.Menu.Item | null = null;
 let timerId: number | null = null;
@@ -347,11 +347,11 @@ function extractTrackFingerprintFromLibraryItem(item: any): TrackFingerprint | n
   const name = item?.name ?? item?.track?.name ?? item?.item?.name;
   const durationMs = normalizeDuration(
     item?.duration_ms ??
-      item?.durationMs ??
-      item?.track?.duration_ms ??
-      item?.track?.durationMs ??
-      item?.track?.duration?.totalMilliseconds ??
-      item?.item?.duration_ms,
+    item?.durationMs ??
+    item?.track?.duration_ms ??
+    item?.track?.durationMs ??
+    item?.track?.duration?.totalMilliseconds ??
+    item?.item?.duration_ms,
   );
 
   if (typeof uri !== "string" || typeof name !== "string") return null;
@@ -723,7 +723,7 @@ function registerTopbarButton(): void {
 
   // Pattern similar to Lucid: construct the button directly when Topbar is ready.
   topbarButton = new Spicetify.Topbar.Button(
-    "WN Sync",
+    "WhatsNew Sync",
     SYNC_ICON,
     () => {
       debug("Manual sync triggered");
