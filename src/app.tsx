@@ -24,6 +24,7 @@ type TrackFingerprint = {
   uri: string;
   name: string;
   durationMs: number | null;
+  isExplicit: boolean | null;
 };
 type TrackNameDurationMap = Map<string, Array<number | null>>;
 type TrackSnapshot = {
@@ -70,7 +71,8 @@ function debugResponse(label: string, payload: unknown): void {
 }
 
 function setMenuItemLabelSafe(item: Spicetify.Menu.Item, label: string): void {
-  const maybeSetName = (item as unknown as { setName?: (name: string) => void }).setName;
+  const maybeSetName = (item as unknown as { setName?: (name: string) => void })
+    .setName;
   if (typeof maybeSetName === "function") {
     maybeSetName(label);
     return;
@@ -123,7 +125,7 @@ function chunks<T>(input: T[], size: number): T[][] {
 
 function normalizeTrackName(name: string): string {
   let normalized = name.toLowerCase().trim();
-  normalized = normalized.replace(/\s*[\(\[].*?[\)\]]/g, "");
+  normalized = normalized.replace(/\s*[([].*?[)\]]/g, "");
   normalized = normalized.replace(
     /\s*-\s*(remaster(ed)?(\s*\d{2,4})?|live|mono|stereo|single version|radio edit).*$/i,
     "",
@@ -132,8 +134,11 @@ function normalizeTrackName(name: string): string {
   return normalized;
 }
 
-function normalizeDuration(durationMs: number | undefined | null): number | null {
-  if (typeof durationMs === "number" && Number.isFinite(durationMs)) return durationMs;
+function normalizeDuration(
+  durationMs: number | undefined | null,
+): number | null {
+  if (typeof durationMs === "number" && Number.isFinite(durationMs))
+    return durationMs;
   return null;
 }
 
@@ -146,7 +151,8 @@ function hasDurationMatch(
   if (!durations) return false;
   for (const existingDuration of durations) {
     if (existingDuration === null || duration === null) return true;
-    if (Math.abs(existingDuration - duration) <= DURATION_TOLERANCE_MS) return true;
+    if (Math.abs(existingDuration - duration) <= DURATION_TOLERANCE_MS)
+      return true;
   }
   return false;
 }
@@ -166,25 +172,77 @@ function buildSnapshot(tracks: TrackFingerprint[]): TrackSnapshot {
   const byNameDuration: TrackNameDurationMap = new Map();
   for (const track of tracks) {
     uriSet.add(track.uri);
-    addDurationEntry(byNameDuration, normalizeTrackName(track.name), track.durationMs);
+    addDurationEntry(
+      byNameDuration,
+      normalizeTrackName(track.name),
+      track.durationMs,
+    );
   }
   return { uriSet, byNameDuration };
+}
+
+function areLikelySameTrack(a: TrackFingerprint, b: TrackFingerprint): boolean {
+  const sameName = normalizeTrackName(a.name) === normalizeTrackName(b.name);
+  if (!sameName) return false;
+  if (a.durationMs === null || b.durationMs === null) return true;
+  return Math.abs(a.durationMs - b.durationMs) <= DURATION_TOLERANCE_MS;
+}
+
+function shouldPreferTrack(
+  candidate: TrackFingerprint,
+  current: TrackFingerprint,
+): boolean {
+  if (candidate.isExplicit === true && current.isExplicit !== true) return true;
+  if (candidate.isExplicit !== true && current.isExplicit === true)
+    return false;
+  return false;
+}
+
+function dedupeTracksPreferringExplicit(
+  tracks: TrackFingerprint[],
+): TrackFingerprint[] {
+  const result: TrackFingerprint[] = [];
+  for (const track of tracks) {
+    if (!track.uri || !track.name) continue;
+    const matchIndex = result.findIndex((existing) =>
+      areLikelySameTrack(existing, track),
+    );
+    if (matchIndex === -1) {
+      result.push(track);
+      continue;
+    }
+    if (shouldPreferTrack(track, result[matchIndex])) {
+      result[matchIndex] = track;
+    }
+  }
+  return result;
 }
 
 function collectAddableTracks(
   candidates: TrackFingerprint[],
   existing: TrackSnapshot,
 ): TrackFingerprint[] {
+  const dedupedCandidates = dedupeTracksPreferringExplicit(candidates);
   const pendingByNameDuration: TrackNameDurationMap = new Map();
   const result: TrackFingerprint[] = [];
 
-  for (const track of candidates) {
+  for (const track of dedupedCandidates) {
     if (!track.uri || !track.name) continue;
     if (existing.uriSet.has(track.uri)) continue;
 
     const normalizedName = normalizeTrackName(track.name);
-    if (hasDurationMatch(existing.byNameDuration, normalizedName, track.durationMs)) continue;
-    if (hasDurationMatch(pendingByNameDuration, normalizedName, track.durationMs)) continue;
+    if (
+      hasDurationMatch(
+        existing.byNameDuration,
+        normalizedName,
+        track.durationMs,
+      )
+    )
+      continue;
+    if (
+      hasDurationMatch(pendingByNameDuration, normalizedName, track.durationMs)
+    )
+      continue;
 
     addDurationEntry(pendingByNameDuration, normalizedName, track.durationMs);
     result.push(track);
@@ -193,14 +251,23 @@ function collectAddableTracks(
   return result;
 }
 
-function addTracksToSnapshot(snapshot: TrackSnapshot, tracks: TrackFingerprint[]): void {
+function addTracksToSnapshot(
+  snapshot: TrackSnapshot,
+  tracks: TrackFingerprint[],
+): void {
   for (const track of tracks) {
     snapshot.uriSet.add(track.uri);
-    addDurationEntry(snapshot.byNameDuration, normalizeTrackName(track.name), track.durationMs);
+    addDurationEntry(
+      snapshot.byNameDuration,
+      normalizeTrackName(track.name),
+      track.durationMs,
+    );
   }
 }
 
-async function getAllAlbumTracks(albumUri: string): Promise<TrackFingerprint[]> {
+async function getAllAlbumTracks(
+  albumUri: string,
+): Promise<TrackFingerprint[]> {
   debug(`Loading album tracks: ${albumUri}`, false);
   const query = definitions.queryAlbumTracks;
   const tracks: TrackFingerprint[] = [];
@@ -213,24 +280,39 @@ async function getAllAlbumTracks(albumUri: string): Promise<TrackFingerprint[]> 
       offset,
       limit: 100,
     });
-    debugResponse(`GraphQL queryAlbumTracks response (album=${albumUri}, offset=${offset})`, response);
+    debugResponse(
+      `GraphQL queryAlbumTracks response (album=${albumUri}, offset=${offset})`,
+      response,
+    );
 
-    const items = response?.data?.albumUnion?.tracksV2?.items ?? response?.data?.albumUnion?.tracks?.items ?? [];
+    const items =
+      response?.data?.albumUnion?.tracksV2?.items ??
+      response?.data?.albumUnion?.tracks?.items ??
+      [];
     if (!items || items.length === 0) break;
 
     for (const item of items) {
       const track = item?.track ?? item;
-      if (typeof track?.uri !== "string" || typeof track?.name !== "string") continue;
+      if (typeof track?.uri !== "string" || typeof track?.name !== "string")
+        continue;
       if (seenUris.has(track.uri)) continue;
       seenUris.add(track.uri);
 
       const durationMs = normalizeDuration(
-        track?.duration?.totalMilliseconds ?? track?.durationMs ?? track?.duration_ms,
+        track?.duration?.totalMilliseconds ??
+          track?.durationMs ??
+          track?.duration_ms,
       );
       tracks.push({
         uri: track.uri,
         name: track.name,
         durationMs,
+        isExplicit:
+          typeof track?.isExplicit === "boolean"
+            ? track.isExplicit
+            : typeof track?.explicit === "boolean"
+              ? track.explicit
+              : null,
       });
     }
 
@@ -266,7 +348,10 @@ function collectPlaylists(items: any[], result: PlaylistEntry[]): void {
       result.push({
         name: item.name as string,
         uri: item.uri as string,
-        isOwnedBySelf: typeof item.isOwnedBySelf === "boolean" ? item.isOwnedBySelf : undefined,
+        isOwnedBySelf:
+          typeof item.isOwnedBySelf === "boolean"
+            ? item.isOwnedBySelf
+            : undefined,
       });
     }
 
@@ -281,7 +366,9 @@ function collectPlaylists(items: any[], result: PlaylistEntry[]): void {
 
 async function getAllMyPlaylists(): Promise<PlaylistEntry[]> {
   debug("Reading your playlists from rootlist", false);
-  const rootlist = await Spicetify.Platform.RootlistAPI.getContents({ limit: 50000 });
+  const rootlist = await Spicetify.Platform.RootlistAPI.getContents({
+    limit: 50000,
+  });
   const playlists: PlaylistEntry[] = [];
 
   if (Array.isArray(rootlist?.items)) {
@@ -291,9 +378,14 @@ async function getAllMyPlaylists(): Promise<PlaylistEntry[]> {
   return playlists.filter((playlist) => playlist.isOwnedBySelf !== false);
 }
 
-async function getPlaylistTracks(playlistUri: string): Promise<TrackFingerprint[]> {
+async function getPlaylistTracks(
+  playlistUri: string,
+): Promise<TrackFingerprint[]> {
   debug(`Reading playlist tracks for duplicate check: ${playlistUri}`, false);
-  const contents = await Spicetify.Platform.PlaylistAPI.getContents(playlistUri, { limit: 9999999 });
+  const contents = await Spicetify.Platform.PlaylistAPI.getContents(
+    playlistUri,
+    { limit: 9999999 },
+  );
   const tracks: TrackFingerprint[] = [];
   const seenUris = new Set<string>();
 
@@ -307,13 +399,22 @@ async function getPlaylistTracks(playlistUri: string): Promise<TrackFingerprint[
       uri,
       name,
       durationMs: normalizeDuration(item?.duration_ms),
+      isExplicit:
+        typeof item?.isExplicit === "boolean"
+          ? item.isExplicit
+          : typeof item?.explicit === "boolean"
+            ? item.explicit
+            : null,
     });
   }
 
   return tracks;
 }
 
-function parseContainsResponseToBoolArray(response: any, expectedLength: number): boolean[] {
+function parseContainsResponseToBoolArray(
+  response: any,
+  expectedLength: number,
+): boolean[] {
   if (Array.isArray(response)) return response.map(Boolean);
   if (Array.isArray(response?.contains)) return response.contains.map(Boolean);
   if (Array.isArray(response?.items)) return response.items.map(Boolean);
@@ -326,43 +427,65 @@ async function getUnlikedTrackUris(trackUris: string[]): Promise<string[]> {
 
   for (const batch of chunks(uniqueUris, 50)) {
     try {
-      const response = await Spicetify.Platform.LibraryAPI.contains({ uris: batch });
+      const response = await Spicetify.Platform.LibraryAPI.contains({
+        uris: batch,
+      });
       const contains = parseContainsResponseToBoolArray(response, batch.length);
       for (let i = 0; i < batch.length; i += 1) {
         if (!contains[i]) toAdd.push(batch[i]);
       }
     } catch {
       // Fallback when contains API is unavailable: let add endpoint dedupe server-side.
-      debug("Library contains-check unavailable, falling back to direct add dedupe", false);
+      debug(
+        "Library contains-check unavailable, falling back to direct add dedupe",
+        false,
+      );
       toAdd.push(...batch);
     }
   }
 
-  debug(`Liked Songs dedupe: ${trackUris.length} candidate(s), ${toAdd.length} new`);
+  debug(
+    `Liked Songs dedupe: ${trackUris.length} candidate(s), ${toAdd.length} new`,
+  );
   return toAdd;
 }
 
-function extractTrackFingerprintFromLibraryItem(item: any): TrackFingerprint | null {
+function extractTrackFingerprintFromLibraryItem(
+  item: any,
+): TrackFingerprint | null {
   const uri = item?.uri ?? item?.track?.uri ?? item?.item?.uri;
   const name = item?.name ?? item?.track?.name ?? item?.item?.name;
   const durationMs = normalizeDuration(
     item?.duration_ms ??
-    item?.durationMs ??
-    item?.track?.duration_ms ??
-    item?.track?.durationMs ??
-    item?.track?.duration?.totalMilliseconds ??
-    item?.item?.duration_ms,
+      item?.durationMs ??
+      item?.track?.duration_ms ??
+      item?.track?.durationMs ??
+      item?.track?.duration?.totalMilliseconds ??
+      item?.item?.duration_ms,
   );
 
   if (typeof uri !== "string" || typeof name !== "string") return null;
-  return { uri, name, durationMs };
+  const isExplicit =
+    typeof item?.isExplicit === "boolean"
+      ? item.isExplicit
+      : typeof item?.explicit === "boolean"
+        ? item.explicit
+        : typeof item?.track?.isExplicit === "boolean"
+          ? item.track.isExplicit
+          : typeof item?.track?.explicit === "boolean"
+            ? item.track.explicit
+            : null;
+  return { uri, name, durationMs, isExplicit };
 }
 
 async function getLikedSongsSnapshot(): Promise<TrackSnapshot | null> {
   const libraryApi = Spicetify.Platform?.LibraryAPI;
   const getTracksMethod = libraryApi?.getTracks;
   if (typeof getTracksMethod !== "function") {
-    debug("LibraryAPI.getTracks is unavailable; falling back to URI-only contains check", false);
+    debug(
+      "LibraryAPI.getTracks is unavailable; falling back to URI-only contains check",
+      false,
+    );
     return null;
   }
 
@@ -386,21 +509,35 @@ async function getLikedSongsSnapshot(): Promise<TrackSnapshot | null> {
         pageAdded += 1;
       }
 
-      debug(`Liked Songs snapshot page loaded: offset=${offset}, items=${items.length}, added=${pageAdded}`, false);
+      debug(
+        `Liked Songs snapshot page loaded: offset=${offset}, items=${items.length}, added=${pageAdded}`,
+        false,
+      );
       if (items.length < pageSize) break;
       offset += pageSize;
     }
 
-    debug(`Loaded Liked Songs snapshot via LibraryAPI: ${collected.length} track(s)`, false);
+    debug(
+      `Loaded Liked Songs snapshot via LibraryAPI: ${collected.length} track(s)`,
+      false,
+    );
     return buildSnapshot(collected);
   } catch (error) {
-    debug(`LibraryAPI.getTracks failed, using URI-only contains fallback: ${String(error)}`, false);
+    debug(
+      `LibraryAPI.getTracks failed, using URI-only contains fallback: ${String(error)}`,
+      false,
+    );
     return null;
   }
 }
 
-function findMatchingPlaylists(playlists: PlaylistEntry[], artistNames: string[]): PlaylistEntry[] {
-  const normalizedArtists = new Set(artistNames.map((name) => normalizeName(name)));
+function findMatchingPlaylists(
+  playlists: PlaylistEntry[],
+  artistNames: string[],
+): PlaylistEntry[] {
+  const normalizedArtists = new Set(
+    artistNames.map((name) => normalizeName(name)),
+  );
   return playlists.filter((playlist) => {
     const namesInPlaylist = splitPlaylistArtistNames(playlist.name);
     return namesInPlaylist.some((name) => normalizedArtists.has(name));
@@ -426,7 +563,9 @@ async function addTracksToPlaylistDeduped(
 
   const toAdd = toAddTracks.map((track) => track.uri);
   for (const batch of chunks(toAdd, 100)) {
-    await Spicetify.Platform.PlaylistAPI.add(playlistUri, batch, { after: "end" });
+    await Spicetify.Platform.PlaylistAPI.add(playlistUri, batch, {
+      after: "end",
+    });
   }
   addTracksToSnapshot(existingSnapshot, toAddTracks);
 
@@ -444,19 +583,28 @@ async function queryWhatsNewFeedItems(): Promise<WhatsNewFeedItem[]> {
 
   while (page < MAX_FEED_PAGES_SAFETY) {
     if (seenOffsets.has(offset)) {
-      debug(`Stopping feed pagination: offset loop detected at ${offset}`, false);
+      debug(
+        `Stopping feed pagination: offset loop detected at ${offset}`,
+        false,
+      );
       break;
     }
     seenOffsets.add(offset);
 
     debug(`Querying Whats New page ${page + 1} (offset ${offset})`, false);
-    const response = await spotifyGraphQL.Request(definitions.queryWhatsNewFeed, {
-      offset,
-      limit: FEED_PAGE_SIZE,
-      onlyUnPlayedItems: false,
-      includedContentTypes: [],
-    });
-    debugResponse(`GraphQL queryWhatsNewFeed response (page=${page + 1}, offset=${offset})`, response);
+    const response = await spotifyGraphQL.Request(
+      definitions.queryWhatsNewFeed,
+      {
+        offset,
+        limit: FEED_PAGE_SIZE,
+        onlyUnPlayedItems: false,
+        includedContentTypes: [],
+      },
+    );
+    debugResponse(
+      `GraphQL queryWhatsNewFeed response (page=${page + 1}, offset=${offset})`,
+      response,
+    );
 
     const feed = response?.data?.whatsNewFeedItems;
     const items = (feed?.items ?? []) as WhatsNewFeedItem[];
@@ -467,7 +615,8 @@ async function queryWhatsNewFeedItems(): Promise<WhatsNewFeedItem[]> {
     }
     const nextOffset = feed?.pagingInfo?.nextOffset;
     const totalCount = feed?.totalCount;
-    const hasExplicitNextOffset = typeof nextOffset === "number" && Number.isFinite(nextOffset);
+    const hasExplicitNextOffset =
+      typeof nextOffset === "number" && Number.isFinite(nextOffset);
     const computedNextOffset = offset + FEED_PAGE_SIZE;
     const canFallbackBySize = items.length > 0;
     const fallbackNextOffset = canFallbackBySize ? computedNextOffset : null;
@@ -479,7 +628,10 @@ async function queryWhatsNewFeedItems(): Promise<WhatsNewFeedItem[]> {
 
     if (items.length === 0) {
       consecutiveEmptyPages += 1;
-      debug(`Feed page empty (${consecutiveEmptyPages}/${MAX_EMPTY_FEED_PAGES})`, false);
+      debug(
+        `Feed page empty (${consecutiveEmptyPages}/${MAX_EMPTY_FEED_PAGES})`,
+        false,
+      );
       if (consecutiveEmptyPages >= MAX_EMPTY_FEED_PAGES) {
         debug("Stopping feed pagination: repeated empty pages", false);
         break;
@@ -492,7 +644,10 @@ async function queryWhatsNewFeedItems(): Promise<WhatsNewFeedItem[]> {
     // Prefer explicit nextOffset when available, otherwise probe by offset+limit.
     const next = hasExplicitNextOffset ? nextOffset : fallbackNextOffset;
     if (typeof next !== "number" || !Number.isFinite(next) || next <= offset) {
-      debug("Stopping feed pagination: no valid next offset provided by API", false);
+      debug(
+        "Stopping feed pagination: no valid next offset provided by API",
+        false,
+      );
       break;
     }
 
@@ -501,7 +656,10 @@ async function queryWhatsNewFeedItems(): Promise<WhatsNewFeedItem[]> {
   }
 
   if (page >= MAX_FEED_PAGES_SAFETY) {
-    debug(`Stopped feed pagination at safety cap (${MAX_FEED_PAGES_SAFETY} pages)`, false);
+    debug(
+      `Stopped feed pagination at safety cap (${MAX_FEED_PAGES_SAFETY} pages)`,
+      false,
+    );
   }
 
   return allItems;
@@ -512,15 +670,21 @@ async function markFeedItemsSeen(feedItemIds: string[]): Promise<void> {
   debug(`Marking ${feedItemIds.length} feed item(s) as SEEN`);
 
   for (const batch of chunks(feedItemIds, 50)) {
-    const response = await spotifyGraphQL.Request(definitions.SetItemsStateInWhatsNewFeed, {
-      items: {
-        items: batch.map((id) => ({
-          id,
-          state: "SEEN",
-        })),
+    const response = await spotifyGraphQL.Request(
+      definitions.SetItemsStateInWhatsNewFeed,
+      {
+        items: {
+          items: batch.map((id) => ({
+            id,
+            state: "SEEN",
+          })),
+        },
       },
-    });
-    debugResponse(`GraphQL SetItemsStateInWhatsNewFeed response (batch=${batch.length})`, response);
+    );
+    debugResponse(
+      `GraphQL SetItemsStateInWhatsNewFeed response (batch=${batch.length})`,
+      response,
+    );
   }
 }
 
@@ -558,6 +722,7 @@ async function runSync(options?: { force?: boolean }): Promise<void> {
     const existingTracksByPlaylist = new Map<string, TrackSnapshot>();
     const likedSongsSnapshot = await getLikedSongsSnapshot();
     const feedIdsToMarkSeen: string[] = [];
+    const feedIdsToMarkSeenSet = new Set<string>();
     let releasesHandled = 0;
     let tracksHandled = 0;
     let skippedProcessed = 0;
@@ -565,6 +730,14 @@ async function runSync(options?: { force?: boolean }): Promise<void> {
     let skippedInvalidAlbum = 0;
     let skippedNoArtists = 0;
 
+    type PendingRelease = {
+      feedItemId: string;
+      albumUri: string;
+      albumName: string;
+      artistNames: string[];
+    };
+
+    const pendingReleases: PendingRelease[] = [];
     for (const item of feedItems) {
       if (!item.id) continue;
       if (!bypassProcessedCache && processedFeedIds.has(item.id)) {
@@ -588,70 +761,137 @@ async function runSync(options?: { force?: boolean }): Promise<void> {
           if (!artist.uri || !artist.profile?.name) return null;
           return { artistUri: artist.uri, artistName: artist.profile.name };
         })
-        .filter((artist): artist is { artistUri: string; artistName: string } => Boolean(artist));
+        .filter((artist): artist is { artistUri: string; artistName: string } =>
+          Boolean(artist),
+        );
 
       if (artistData.length === 0) {
         skippedNoArtists += 1;
         continue;
       }
 
+      if (item.state?.state) {
+        debug(
+          `Feed item state is "${item.state.state}" (processing anyway)`,
+          false,
+        );
+      }
+      pendingReleases.push({
+        feedItemId: item.id,
+        albumUri: album.uri,
+        albumName: album.name ?? album.uri,
+        artistNames: artistData.map((artist) => artist.artistName),
+      });
+    }
+
+    const releaseTracksByFeedItem = new Map<string, TrackFingerprint[]>();
+    for (const release of pendingReleases) {
       try {
-        debug(`Processing release: ${album.name ?? album.uri}`);
-        if (item.state?.state) {
-          debug(`Feed item state is "${item.state.state}" (processing anyway)`, false);
-        }
-        const releaseTracks = await getAllAlbumTracks(album.uri);
-        if (releaseTracks.length === 0) {
+        debug(`Loading release tracks: ${release.albumName}`);
+        const tracks = dedupeTracksPreferringExplicit(
+          await getAllAlbumTracks(release.albumUri),
+        );
+        releaseTracksByFeedItem.set(release.feedItemId, tracks);
+        if (tracks.length === 0) {
           debug("Release has no tracks, marking as processed");
-          processedFeedIds.add(item.id);
-          feedIdsToMarkSeen.push(item.id);
+          processedFeedIds.add(release.feedItemId);
+          feedIdsToMarkSeenSet.add(release.feedItemId);
           continue;
         }
-        debug(`Release track count: ${releaseTracks.length}`);
-
-        const releaseArtistNames = artistData.map((artist) => artist.artistName);
-        const matchingPlaylists = findMatchingPlaylists(myPlaylists, releaseArtistNames);
-        debug(
-          `Artist(s): ${releaseArtistNames.join(", ")} | Matching playlist(s): ${matchingPlaylists.map((p) => p.name).join(" | ") || "none"}`,
-        );
-
-        let likedToAddUris: string[] = [];
-        if (likedSongsSnapshot) {
-          const likedToAddTracks = collectAddableTracks(releaseTracks, likedSongsSnapshot);
-          likedToAddUris = likedToAddTracks.map((track) => track.uri);
-          if (likedToAddTracks.length > 0) {
-            await likeTracks(likedToAddUris);
-            addTracksToSnapshot(likedSongsSnapshot, likedToAddTracks);
-          }
-        } else {
-          likedToAddUris = await getUnlikedTrackUris(releaseTracks.map((track) => track.uri));
-          if (likedToAddUris.length > 0) {
-            await likeTracks(likedToAddUris);
-          }
-        }
-        if (likedToAddUris.length === 0) {
-          debug("All release tracks already in Liked Songs (or equivalent duplicates)");
-        }
-
-        for (const playlist of matchingPlaylists) {
-          await addTracksToPlaylistDeduped(playlist.uri, releaseTracks, existingTracksByPlaylist);
-        }
-        if (matchingPlaylists.length === 0) {
-          debug("No matching playlists for this release; only updated Liked Songs", false);
-        }
-
-        processedFeedIds.add(item.id);
-        feedIdsToMarkSeen.push(item.id);
         releasesHandled += 1;
-        tracksHandled += likedToAddUris.length;
+        debug(
+          `Release track count (deduped explicit-first): ${tracks.length}`,
+          false,
+        );
       } catch (error) {
-        console.error(`${EXTENSION_NAME}: failed processing release`, {
-          itemId: item.id,
-          albumUri: album.uri,
+        console.error(`${EXTENSION_NAME}: failed loading release tracks`, {
+          itemId: release.feedItemId,
+          albumUri: release.albumUri,
           error,
         });
       }
     }
+
+    const allReleaseTracks = dedupeTracksPreferringExplicit(
+      pendingReleases.flatMap(
+        (release) => releaseTracksByFeedItem.get(release.feedItemId) ?? [],
+      ),
+    );
+    debug(
+      `Total feed tracks after global dedupe (explicit-first): ${allReleaseTracks.length}`,
+      false,
+    );
+
+    let likedToAddUris: string[] = [];
+    if (likedSongsSnapshot) {
+      const likedToAddTracks = collectAddableTracks(
+        allReleaseTracks,
+        likedSongsSnapshot,
+      );
+      likedToAddUris = likedToAddTracks.map((track) => track.uri);
+      if (likedToAddTracks.length > 0) {
+        await likeTracks(likedToAddUris);
+        addTracksToSnapshot(likedSongsSnapshot, likedToAddTracks);
+      }
+    } else {
+      likedToAddUris = await getUnlikedTrackUris(
+        allReleaseTracks.map((track) => track.uri),
+      );
+      if (likedToAddUris.length > 0) {
+        await likeTracks(likedToAddUris);
+      }
+    }
+    if (likedToAddUris.length === 0) {
+      debug(
+        "All feed tracks already in Liked Songs (or equivalent duplicates)",
+      );
+    }
+    tracksHandled += likedToAddUris.length;
+
+    const candidateTracksByPlaylist = new Map<string, TrackFingerprint[]>();
+    for (const release of pendingReleases) {
+      const releaseTracks =
+        releaseTracksByFeedItem.get(release.feedItemId) ?? [];
+      if (releaseTracks.length === 0) continue;
+      const matchingPlaylists = findMatchingPlaylists(
+        myPlaylists,
+        release.artistNames,
+      );
+      debug(
+        `Artist(s): ${release.artistNames.join(", ")} | Matching playlist(s): ${matchingPlaylists.map((p) => p.name).join(" | ") || "none"}`,
+        false,
+      );
+      for (const playlist of matchingPlaylists) {
+        const existing = candidateTracksByPlaylist.get(playlist.uri) ?? [];
+        existing.push(...releaseTracks);
+        candidateTracksByPlaylist.set(playlist.uri, existing);
+      }
+      if (matchingPlaylists.length === 0) {
+        debug(
+          "No matching playlists for this release; only updated Liked Songs",
+          false,
+        );
+      }
+    }
+
+    for (const [
+      playlistUri,
+      playlistTracks,
+    ] of candidateTracksByPlaylist.entries()) {
+      const dedupedTracks = dedupeTracksPreferringExplicit(playlistTracks);
+      await addTracksToPlaylistDeduped(
+        playlistUri,
+        dedupedTracks,
+        existingTracksByPlaylist,
+      );
+    }
+
+    for (const release of pendingReleases) {
+      if (!releaseTracksByFeedItem.has(release.feedItemId)) continue;
+      processedFeedIds.add(release.feedItemId);
+      feedIdsToMarkSeenSet.add(release.feedItemId);
+    }
+    feedIdsToMarkSeen.push(...feedIdsToMarkSeenSet);
 
     await markFeedItemsSeen(feedIdsToMarkSeen);
     setProcessedIds(processedFeedIds);
@@ -661,7 +901,9 @@ async function runSync(options?: { force?: boolean }): Promise<void> {
     );
 
     if (releasesHandled > 0) {
-      notify(`Added ${tracksHandled} new tracks to Liked Songs from ${releasesHandled} releases.`);
+      notify(
+        `Added ${tracksHandled} new tracks to Liked Songs from ${releasesHandled} releases.`,
+      );
       debug("Sync completed successfully");
     } else {
       debug("Sync completed: nothing new to process");
@@ -678,29 +920,40 @@ function updateMenuState(): void {
   const enabled = getBoolSetting(ENABLED_KEY, true);
   if (menuItem) {
     menuItem.isEnabled = enabled;
-    setMenuItemLabelSafe(menuItem, `${EXTENSION_NAME} (${enabled ? "ON" : "OFF"})`);
+    setMenuItemLabelSafe(
+      menuItem,
+      `${EXTENSION_NAME} (${enabled ? "ON" : "OFF"})`,
+    );
   }
 }
 
 function setupMenu(): void {
   const enabled = getBoolSetting(ENABLED_KEY, true);
-  menuItem = new Spicetify.Menu.Item(`${EXTENSION_NAME} (${enabled ? "ON" : "OFF"})`, enabled, (self) => {
-    const next = !self.isEnabled;
-    self.isEnabled = next;
-    setBoolSetting(ENABLED_KEY, next);
-    updateMenuState();
-    notify(next ? "Enabled" : "Disabled");
-  });
+  menuItem = new Spicetify.Menu.Item(
+    `${EXTENSION_NAME} (${enabled ? "ON" : "OFF"})`,
+    enabled,
+    (self) => {
+      const next = !self.isEnabled;
+      self.isEnabled = next;
+      setBoolSetting(ENABLED_KEY, next);
+      updateMenuState();
+      notify(next ? "Enabled" : "Disabled");
+    },
+  );
   menuItem.register();
 
   const verboseDebug = getBoolSetting(VERBOSE_DEBUG_KEY, VERBOSE_DEBUG_DEFAULT);
-  new Spicetify.Menu.Item(`Verbose Debug (${verboseDebug ? "ON" : "OFF"})`, verboseDebug, (self) => {
-    const next = !self.isEnabled;
-    self.isEnabled = next;
-    setBoolSetting(VERBOSE_DEBUG_KEY, next);
-    setMenuItemLabelSafe(self, `Verbose Debug (${next ? "ON" : "OFF"})`);
-    notify(next ? "Verbose debug enabled" : "Verbose debug disabled");
-  }).register();
+  new Spicetify.Menu.Item(
+    `Verbose Debug (${verboseDebug ? "ON" : "OFF"})`,
+    verboseDebug,
+    (self) => {
+      const next = !self.isEnabled;
+      self.isEnabled = next;
+      setBoolSetting(VERBOSE_DEBUG_KEY, next);
+      setMenuItemLabelSafe(self, `Verbose Debug (${next ? "ON" : "OFF"})`);
+      notify(next ? "Verbose debug enabled" : "Verbose debug disabled");
+    },
+  ).register();
 }
 
 function startScheduler(): void {

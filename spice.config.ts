@@ -1,5 +1,5 @@
-import { resolve } from "path";
 import { defineConfig } from "@spicemod/creator";
+import { resolve } from "path";
 
 // Learn more: https://github.com/sanoojes/spicetify-creator
 export default defineConfig({

@@ -10,7 +10,7 @@
     "build": "spicetify-creator build",
     "update-types": "spicetify-creator update-types",
     "clean-spice": "spicetify-creator clean-spicetify --all",
-    "lint": "biome check --apply ."
+    "lint": "biome check --write ."
   },
   "dependencies": {
     "react": "^18.3.1",
