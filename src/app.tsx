@@ -40,8 +40,10 @@ const MAX_EMPTY_FEED_PAGES = 2;
 const DURATION_TOLERANCE_MS = 5000;
 const PROCESSED_IDS_KEY = "whatsnew:processed-feed-ids";
 const ENABLED_KEY = "whatsnew:enabled";
-const VERBOSE_DEBUG_KEY = "whatsnew:verbose-debug";
-const VERBOSE_DEBUG_DEFAULT = true;
+const DRY_RUN_KEY = "whatsnew:dry-run";
+const VERBOSE_DEBUG_KEY_LEGACY = "whatsnew:verbose-debug";
+const LOG_TAG = "[WhatsNew:dryrun]";
+const ERROR_TAG = "[WhatsNew]";
 const SYNC_ICON =
   '<svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M13 8a5 5 0 0 0-8.66-3.54" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/><path stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" d="M4 2v3h3M3 8a5 5 0 0 0 8.66 3.54"/><path stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" d="M12 14v-3H9"/></svg>';
 
@@ -57,17 +59,17 @@ function notify(message: string, isError = false): void {
   Spicetify.showNotification(`${EXTENSION_NAME}: ${message}`, isError, 5000);
 }
 
-function debug(message: string, toast = true): void {
-  // Always log to console; optional toast for high visibility.
-  console.log(`[${EXTENSION_NAME}] ${message}`);
-  if (toast && getBoolSetting(VERBOSE_DEBUG_KEY, VERBOSE_DEBUG_DEFAULT)) {
-    Spicetify.showNotification(`${EXTENSION_NAME}: ${message}`, false, 2500);
-  }
+function isDryRun(): boolean {
+  return getBoolSetting(DRY_RUN_KEY, false);
 }
 
-function debugResponse(label: string, payload: unknown): void {
-  if (!getBoolSetting(VERBOSE_DEBUG_KEY, VERBOSE_DEBUG_DEFAULT)) return;
-  console.log(`[${EXTENSION_NAME}] ${label}`, payload);
+function log(...args: unknown[]): void {
+  if (!isDryRun()) return;
+  console.log(LOG_TAG, ...args);
+}
+
+function logError(...args: unknown[]): void {
+  console.error(isDryRun() ? LOG_TAG : ERROR_TAG, ...args);
 }
 
 function setMenuItemLabelSafe(item: Spicetify.Menu.Item, label: string): void {
@@ -111,6 +113,10 @@ function getProcessedIds(): Set<string> {
 }
 
 function setProcessedIds(ids: Set<string>): void {
+  if (isDryRun()) {
+    log("would: persist processed feed ids", { count: ids.size });
+    return;
+  }
   const trimmed = Array.from(ids).slice(-5000);
   setJson(PROCESSED_IDS_KEY, trimmed);
 }
@@ -268,7 +274,7 @@ function addTracksToSnapshot(
 async function getAllAlbumTracks(
   albumUri: string,
 ): Promise<TrackFingerprint[]> {
-  debug(`Loading album tracks: ${albumUri}`, false);
+  log("Loading album tracks", albumUri);
   const query = definitions.queryAlbumTracks;
   const tracks: TrackFingerprint[] = [];
   const seenUris = new Set<string>();
@@ -280,7 +286,7 @@ async function getAllAlbumTracks(
       offset,
       limit: 100,
     });
-    debugResponse(
+    log(
       `GraphQL queryAlbumTracks response (album=${albumUri}, offset=${offset})`,
       response,
     );
@@ -324,7 +330,10 @@ async function getAllAlbumTracks(
 }
 
 async function likeTracks(trackUris: string[]): Promise<void> {
-  debug(`Adding ${trackUris.length} track(s) to Liked Songs`);
+  if (isDryRun()) {
+    log("would: add tracks to Liked Songs", { count: trackUris.length, uris: trackUris });
+    return;
+  }
   for (const batch of chunks(trackUris, 50)) {
     await Spicetify.Platform.LibraryAPI.add({ uris: batch });
   }
@@ -365,7 +374,7 @@ function collectPlaylists(items: any[], result: PlaylistEntry[]): void {
 }
 
 async function getAllMyPlaylists(): Promise<PlaylistEntry[]> {
-  debug("Reading your playlists from rootlist", false);
+  log("Reading your playlists from rootlist");
   const rootlist = await Spicetify.Platform.RootlistAPI.getContents({
     limit: 50000,
   });
@@ -381,7 +390,7 @@ async function getAllMyPlaylists(): Promise<PlaylistEntry[]> {
 async function getPlaylistTracks(
   playlistUri: string,
 ): Promise<TrackFingerprint[]> {
-  debug(`Reading playlist tracks for duplicate check: ${playlistUri}`, false);
+  log("Reading playlist tracks for duplicate check", playlistUri);
   const contents = await Spicetify.Platform.PlaylistAPI.getContents(
     playlistUri,
     { limit: 9999999 },
@@ -412,13 +421,41 @@ async function getPlaylistTracks(
 }
 
 function parseContainsResponseToBoolArray(
-  response: any,
+  response: unknown,
   expectedLength: number,
-): boolean[] {
-  if (Array.isArray(response)) return response.map(Boolean);
-  if (Array.isArray(response?.contains)) return response.contains.map(Boolean);
-  if (Array.isArray(response?.items)) return response.items.map(Boolean);
-  return new Array<boolean>(expectedLength).fill(false);
+): boolean[] | null {
+  const asBools = (value: unknown): boolean[] | null => {
+    if (!Array.isArray(value) || value.length !== expectedLength) return null;
+    return value.map(Boolean);
+  };
+
+  if (Array.isArray(response)) return asBools(response);
+  if (response && typeof response === "object") {
+    const obj = response as Record<string, unknown>;
+    return (
+      asBools(obj.contains) ??
+      asBools(obj.items) ??
+      asBools(obj.result) ??
+      asBools(obj.data)
+    );
+  }
+  return null;
+}
+
+async function libraryContains(uris: string[]): Promise<boolean[] | null> {
+  const api = Spicetify.Platform.LibraryAPI;
+  // Prefer object form (matches LibraryAPI.add); fall back to bare uris array.
+  for (const args of [{ uris }, uris] as const) {
+    try {
+      const response = await api.contains(args as never);
+      const parsed = parseContainsResponseToBoolArray(response, uris.length);
+      if (parsed) return parsed;
+      log("LibraryAPI.contains unparsed response shape", { args, response });
+    } catch (error) {
+      log("LibraryAPI.contains call failed", { args, error: String(error) });
+    }
+  }
+  return null;
 }
 
 async function getUnlikedTrackUris(trackUris: string[]): Promise<string[]> {
@@ -426,25 +463,21 @@ async function getUnlikedTrackUris(trackUris: string[]): Promise<string[]> {
   const toAdd: string[] = [];
 
   for (const batch of chunks(uniqueUris, 50)) {
-    try {
-      const response = await Spicetify.Platform.LibraryAPI.contains({
-        uris: batch,
-      });
-      const contains = parseContainsResponseToBoolArray(response, batch.length);
-      for (let i = 0; i < batch.length; i += 1) {
-        if (!contains[i]) toAdd.push(batch[i]);
-      }
-    } catch {
-      // Fallback when contains API is unavailable: let add endpoint dedupe server-side.
-      debug(
-        "Library contains-check unavailable, falling back to direct add dedupe",
-        false,
+    const contains = await libraryContains(batch);
+    if (!contains) {
+      // Fail closed: unknown contains shape must not look like "all unliked".
+      log(
+        "Library contains-check unavailable; skipping Liked Songs adds for this batch",
+        { batchSize: batch.length },
       );
-      toAdd.push(...batch);
+      continue;
+    }
+    for (let i = 0; i < batch.length; i += 1) {
+      if (!contains[i]) toAdd.push(batch[i]);
     }
   }
 
-  debug(
+  log(
     `Liked Songs dedupe: ${trackUris.length} candidate(s), ${toAdd.length} new`,
   );
   return toAdd;
@@ -480,11 +513,9 @@ function extractTrackFingerprintFromLibraryItem(
 
 async function getLikedSongsSnapshot(): Promise<TrackSnapshot | null> {
   const libraryApi = Spicetify.Platform?.LibraryAPI;
-  const getTracksMethod = libraryApi?.getTracks;
-  if (typeof getTracksMethod !== "function") {
-    debug(
+  if (typeof libraryApi?.getTracks !== "function") {
+    log(
       "LibraryAPI.getTracks is unavailable; falling back to URI-only contains check",
-      false,
     );
     return null;
   }
@@ -496,7 +527,8 @@ async function getLikedSongsSnapshot(): Promise<TrackSnapshot | null> {
     const pageSize = 200;
 
     while (true) {
-      const response = await getTracksMethod({ offset, limit: pageSize });
+      // Must call as a method — extracting getTracks drops `this` (_collection).
+      const response = await libraryApi.getTracks({ offset, limit: pageSize });
       const items = response?.items ?? response ?? [];
       if (!Array.isArray(items) || items.length === 0) break;
 
@@ -509,23 +541,20 @@ async function getLikedSongsSnapshot(): Promise<TrackSnapshot | null> {
         pageAdded += 1;
       }
 
-      debug(
+      log(
         `Liked Songs snapshot page loaded: offset=${offset}, items=${items.length}, added=${pageAdded}`,
-        false,
       );
       if (items.length < pageSize) break;
       offset += pageSize;
     }
 
-    debug(
+    log(
       `Loaded Liked Songs snapshot via LibraryAPI: ${collected.length} track(s)`,
-      false,
     );
     return buildSnapshot(collected);
   } catch (error) {
-    debug(
+    log(
       `LibraryAPI.getTracks failed, using URI-only contains fallback: ${String(error)}`,
-      false,
     );
     return null;
   }
@@ -557,19 +586,26 @@ async function addTracksToPlaylistDeduped(
 
   const toAddTracks = collectAddableTracks(releaseTracks, existingSnapshot);
   if (toAddTracks.length === 0) {
-    debug(`Playlist already up to date: ${playlistUri}`, false);
+    log("Playlist already up to date", playlistUri);
     return 0;
   }
 
   const toAdd = toAddTracks.map((track) => track.uri);
-  for (const batch of chunks(toAdd, 100)) {
-    await Spicetify.Platform.PlaylistAPI.add(playlistUri, batch, {
-      after: "end",
+  if (isDryRun()) {
+    log("would: add tracks to playlist", {
+      playlistUri,
+      count: toAdd.length,
+      uris: toAdd,
     });
+  } else {
+    for (const batch of chunks(toAdd, 100)) {
+      await Spicetify.Platform.PlaylistAPI.add(playlistUri, batch, {
+        after: "end",
+      });
+    }
+    log(`Added ${toAdd.length} track(s) to playlist: ${playlistUri}`);
   }
   addTracksToSnapshot(existingSnapshot, toAddTracks);
-
-  debug(`Added ${toAdd.length} track(s) to playlist: ${playlistUri}`);
   return toAdd.length;
 }
 
@@ -583,15 +619,12 @@ async function queryWhatsNewFeedItems(): Promise<WhatsNewFeedItem[]> {
 
   while (page < MAX_FEED_PAGES_SAFETY) {
     if (seenOffsets.has(offset)) {
-      debug(
-        `Stopping feed pagination: offset loop detected at ${offset}`,
-        false,
-      );
+      log(`Stopping feed pagination: offset loop detected at ${offset}`);
       break;
     }
     seenOffsets.add(offset);
 
-    debug(`Querying Whats New page ${page + 1} (offset ${offset})`, false);
+    log(`Querying Whats New page ${page + 1} (offset ${offset})`);
     const response = await spotifyGraphQL.Request(
       definitions.queryWhatsNewFeed,
       {
@@ -601,7 +634,7 @@ async function queryWhatsNewFeedItems(): Promise<WhatsNewFeedItem[]> {
         includedContentTypes: [],
       },
     );
-    debugResponse(
+    log(
       `GraphQL queryWhatsNewFeed response (page=${page + 1}, offset=${offset})`,
       response,
     );
@@ -621,19 +654,17 @@ async function queryWhatsNewFeedItems(): Promise<WhatsNewFeedItem[]> {
     const canFallbackBySize = items.length > 0;
     const fallbackNextOffset = canFallbackBySize ? computedNextOffset : null;
 
-    debug(
+    log(
       `Feed page ${page + 1}: received ${items.length} item(s), accumulated ${allItems.length}${typeof totalCount === "number" ? ` / total ${totalCount}` : ""}, nextOffset=${String(nextOffset)}, fallbackNextOffset=${String(fallbackNextOffset)}`,
-      false,
     );
 
     if (items.length === 0) {
       consecutiveEmptyPages += 1;
-      debug(
+      log(
         `Feed page empty (${consecutiveEmptyPages}/${MAX_EMPTY_FEED_PAGES})`,
-        false,
       );
       if (consecutiveEmptyPages >= MAX_EMPTY_FEED_PAGES) {
-        debug("Stopping feed pagination: repeated empty pages", false);
+        log("Stopping feed pagination: repeated empty pages");
         break;
       }
     } else {
@@ -644,10 +675,7 @@ async function queryWhatsNewFeedItems(): Promise<WhatsNewFeedItem[]> {
     // Prefer explicit nextOffset when available, otherwise probe by offset+limit.
     const next = hasExplicitNextOffset ? nextOffset : fallbackNextOffset;
     if (typeof next !== "number" || !Number.isFinite(next) || next <= offset) {
-      debug(
-        "Stopping feed pagination: no valid next offset provided by API",
-        false,
-      );
+      log("Stopping feed pagination: no valid next offset provided by API");
       break;
     }
 
@@ -656,9 +684,8 @@ async function queryWhatsNewFeedItems(): Promise<WhatsNewFeedItem[]> {
   }
 
   if (page >= MAX_FEED_PAGES_SAFETY) {
-    debug(
+    log(
       `Stopped feed pagination at safety cap (${MAX_FEED_PAGES_SAFETY} pages)`,
-      false,
     );
   }
 
@@ -667,7 +694,13 @@ async function queryWhatsNewFeedItems(): Promise<WhatsNewFeedItem[]> {
 
 async function markFeedItemsSeen(feedItemIds: string[]): Promise<void> {
   if (feedItemIds.length === 0) return;
-  debug(`Marking ${feedItemIds.length} feed item(s) as SEEN`);
+  if (isDryRun()) {
+    log("would: mark feed items as SEEN", {
+      count: feedItemIds.length,
+      ids: feedItemIds,
+    });
+    return;
+  }
 
   for (const batch of chunks(feedItemIds, 50)) {
     const response = await spotifyGraphQL.Request(
@@ -681,7 +714,7 @@ async function markFeedItemsSeen(feedItemIds: string[]): Promise<void> {
         },
       },
     );
-    debugResponse(
+    log(
       `GraphQL SetItemsStateInWhatsNewFeed response (batch=${batch.length})`,
       response,
     );
@@ -691,44 +724,46 @@ async function markFeedItemsSeen(feedItemIds: string[]): Promise<void> {
 async function runSync(options?: { force?: boolean }): Promise<void> {
   const force = options?.force === true;
   if (isRunning) {
-    debug("Sync skipped: previous sync still running");
+    log("Sync skipped: previous sync still running");
     return;
   }
-  if (!force && !getBoolSetting(ENABLED_KEY, true)) {
-    debug("Sync skipped: extension disabled", false);
+  if (!force && !getBoolSetting(ENABLED_KEY, false)) {
+    log("Sync skipped: extension disabled");
     return;
   }
   if (force) {
-    debug("Force sync enabled: bypassing auto-save toggle", false);
+    log("Force sync enabled: bypassing auto-save toggle");
   }
   isRunning = true;
 
   try {
-    debug("Starting sync");
+    log("Starting sync", { dryRun: isDryRun(), force });
     const feedItems = await queryWhatsNewFeedItems();
     if (feedItems.length === 0) {
-      debug("No feed items returned");
+      log("No feed items returned");
       return;
     }
-    debug(`Fetched ${feedItems.length} feed item(s)`);
+    log(`Fetched ${feedItems.length} feed item(s)`);
 
     const processedFeedIds = getProcessedIds();
     const bypassProcessedCache = force;
     if (bypassProcessedCache) {
-      debug("Force sync enabled: bypassing processed-items cache", false);
+      log("Force sync enabled: bypassing processed-items cache");
     }
     const myPlaylists = await getAllMyPlaylists();
-    debug(`Found ${myPlaylists.length} owned playlist(s)`);
+    log(`Found ${myPlaylists.length} owned playlist(s)`);
     const existingTracksByPlaylist = new Map<string, TrackSnapshot>();
     const likedSongsSnapshot = await getLikedSongsSnapshot();
-    const feedIdsToMarkSeen: string[] = [];
-    const feedIdsToMarkSeenSet = new Set<string>();
+    const feedIdsToMarkSeen = new Set<string>();
     let releasesHandled = 0;
     let tracksHandled = 0;
     let skippedProcessed = 0;
     let skippedNonAlbum = 0;
     let skippedInvalidAlbum = 0;
     let skippedNoArtists = 0;
+    let feedStateNew = 0;
+    let feedStateSeen = 0;
+    let feedStateOther = 0;
 
     type PendingRelease = {
       feedItemId: string;
@@ -770,12 +805,10 @@ async function runSync(options?: { force?: boolean }): Promise<void> {
         continue;
       }
 
-      if (item.state?.state) {
-        debug(
-          `Feed item state is "${item.state.state}" (processing anyway)`,
-          false,
-        );
-      }
+      const feedState = item.state?.state;
+      if (feedState === "NEW") feedStateNew += 1;
+      else if (feedState === "SEEN") feedStateSeen += 1;
+      else feedStateOther += 1;
       pendingReleases.push({
         feedItemId: item.id,
         albumUri: album.uri,
@@ -785,41 +818,42 @@ async function runSync(options?: { force?: boolean }): Promise<void> {
     }
 
     const releaseTracksByFeedItem = new Map<string, TrackFingerprint[]>();
-    for (const release of pendingReleases) {
-      try {
-        debug(`Loading release tracks: ${release.albumName}`);
-        const tracks = dedupeTracksPreferringExplicit(
-          await getAllAlbumTracks(release.albumUri),
-        );
-        releaseTracksByFeedItem.set(release.feedItemId, tracks);
-        if (tracks.length === 0) {
-          debug("Release has no tracks, marking as processed");
-          processedFeedIds.add(release.feedItemId);
-          feedIdsToMarkSeenSet.add(release.feedItemId);
-          continue;
+    await Promise.all(
+      pendingReleases.map(async (release) => {
+        try {
+          log("Loading release tracks", release.albumName);
+          const tracks = dedupeTracksPreferringExplicit(
+            await getAllAlbumTracks(release.albumUri),
+          );
+          releaseTracksByFeedItem.set(release.feedItemId, tracks);
+          if (tracks.length === 0) {
+            log("Release has no tracks, marking as processed", release.albumName);
+            processedFeedIds.add(release.feedItemId);
+            feedIdsToMarkSeen.add(release.feedItemId);
+            return;
+          }
+          releasesHandled += 1;
+          log(
+            `Release track count (deduped explicit-first): ${tracks.length}`,
+            release.albumName,
+          );
+        } catch (error) {
+          logError("failed loading release tracks", {
+            itemId: release.feedItemId,
+            albumUri: release.albumUri,
+            error,
+          });
         }
-        releasesHandled += 1;
-        debug(
-          `Release track count (deduped explicit-first): ${tracks.length}`,
-          false,
-        );
-      } catch (error) {
-        console.error(`${EXTENSION_NAME}: failed loading release tracks`, {
-          itemId: release.feedItemId,
-          albumUri: release.albumUri,
-          error,
-        });
-      }
-    }
+      }),
+    );
 
     const allReleaseTracks = dedupeTracksPreferringExplicit(
       pendingReleases.flatMap(
         (release) => releaseTracksByFeedItem.get(release.feedItemId) ?? [],
       ),
     );
-    debug(
+    log(
       `Total feed tracks after global dedupe (explicit-first): ${allReleaseTracks.length}`,
-      false,
     );
 
     let likedToAddUris: string[] = [];
@@ -842,7 +876,7 @@ async function runSync(options?: { force?: boolean }): Promise<void> {
       }
     }
     if (likedToAddUris.length === 0) {
-      debug(
+      log(
         "All feed tracks already in Liked Songs (or equivalent duplicates)",
       );
     }
@@ -857,9 +891,8 @@ async function runSync(options?: { force?: boolean }): Promise<void> {
         myPlaylists,
         release.artistNames,
       );
-      debug(
+      log(
         `Artist(s): ${release.artistNames.join(", ")} | Matching playlist(s): ${matchingPlaylists.map((p) => p.name).join(" | ") || "none"}`,
-        false,
       );
       for (const playlist of matchingPlaylists) {
         const existing = candidateTracksByPlaylist.get(playlist.uri) ?? [];
@@ -867,9 +900,9 @@ async function runSync(options?: { force?: boolean }): Promise<void> {
         candidateTracksByPlaylist.set(playlist.uri, existing);
       }
       if (matchingPlaylists.length === 0) {
-        debug(
+        log(
           "No matching playlists for this release; only updated Liked Songs",
-          false,
+          release.albumName,
         );
       }
     }
@@ -889,27 +922,27 @@ async function runSync(options?: { force?: boolean }): Promise<void> {
     for (const release of pendingReleases) {
       if (!releaseTracksByFeedItem.has(release.feedItemId)) continue;
       processedFeedIds.add(release.feedItemId);
-      feedIdsToMarkSeenSet.add(release.feedItemId);
+      feedIdsToMarkSeen.add(release.feedItemId);
     }
-    feedIdsToMarkSeen.push(...feedIdsToMarkSeenSet);
 
-    await markFeedItemsSeen(feedIdsToMarkSeen);
+    await markFeedItemsSeen(Array.from(feedIdsToMarkSeen));
     setProcessedIds(processedFeedIds);
-    debug(
-      `Skip summary: processed=${skippedProcessed}, nonAlbum=${skippedNonAlbum}, invalidAlbum=${skippedInvalidAlbum}, noArtists=${skippedNoArtists}`,
-      false,
+    log(
+      `Skip summary: processed=${skippedProcessed}, nonAlbum=${skippedNonAlbum}, invalidAlbum=${skippedInvalidAlbum}, noArtists=${skippedNoArtists}, feedState NEW=${feedStateNew} SEEN=${feedStateSeen} other=${feedStateOther}`,
     );
 
     if (releasesHandled > 0) {
       notify(
-        `Added ${tracksHandled} new tracks to Liked Songs from ${releasesHandled} releases.`,
+        isDryRun()
+          ? `Dry-run: would add ${tracksHandled} tracks to Liked Songs from ${releasesHandled} releases.`
+          : `Added ${tracksHandled} new tracks to Liked Songs from ${releasesHandled} releases.`,
       );
-      debug("Sync completed successfully");
+      log("Sync completed successfully");
     } else {
-      debug("Sync completed: nothing new to process");
+      log("Sync completed: nothing new to process");
     }
   } catch (error) {
-    console.error(`${EXTENSION_NAME}: sync failed`, error);
+    logError("sync failed", error);
     notify("Sync failed. Check console for details.", true);
   } finally {
     isRunning = false;
@@ -917,7 +950,7 @@ async function runSync(options?: { force?: boolean }): Promise<void> {
 }
 
 function updateMenuState(): void {
-  const enabled = getBoolSetting(ENABLED_KEY, true);
+  const enabled = getBoolSetting(ENABLED_KEY, false);
   if (menuItem) {
     menuItem.isEnabled = enabled;
     setMenuItemLabelSafe(
@@ -928,7 +961,7 @@ function updateMenuState(): void {
 }
 
 function setupMenu(): void {
-  const enabled = getBoolSetting(ENABLED_KEY, true);
+  const enabled = getBoolSetting(ENABLED_KEY, false);
   menuItem = new Spicetify.Menu.Item(
     `${EXTENSION_NAME} (${enabled ? "ON" : "OFF"})`,
     enabled,
@@ -942,16 +975,17 @@ function setupMenu(): void {
   );
   menuItem.register();
 
-  const verboseDebug = getBoolSetting(VERBOSE_DEBUG_KEY, VERBOSE_DEBUG_DEFAULT);
+  const dryRun = isDryRun();
   new Spicetify.Menu.Item(
-    `Verbose Debug (${verboseDebug ? "ON" : "OFF"})`,
-    verboseDebug,
+    `Dry-run Debug (${dryRun ? "ON" : "OFF"})`,
+    dryRun,
     (self) => {
       const next = !self.isEnabled;
       self.isEnabled = next;
-      setBoolSetting(VERBOSE_DEBUG_KEY, next);
-      setMenuItemLabelSafe(self, `Verbose Debug (${next ? "ON" : "OFF"})`);
-      notify(next ? "Verbose debug enabled" : "Verbose debug disabled");
+      setBoolSetting(DRY_RUN_KEY, next);
+      setMenuItemLabelSafe(self, `Dry-run Debug (${next ? "ON" : "OFF"})`);
+      notify(next ? "Dry-run debug enabled" : "Dry-run debug disabled");
+      if (next) log("Dry-run debug enabled — filter console on WhatsNew:dryrun");
     },
   ).register();
 }
@@ -979,22 +1013,30 @@ function registerTopbarButton(): void {
     "WhatsNew Sync",
     SYNC_ICON,
     () => {
-      debug("Manual sync triggered");
+      log("Manual sync triggered");
       void runSync({ force: true });
     },
     false,
     true,
   );
-  debug("Topbar sync button registered", false);
+  log("Topbar sync button registered");
+}
+
+function migrateDryRunSetting(): void {
+  if (Spicetify.LocalStorage.get(DRY_RUN_KEY) !== null) return;
+  const legacy = Spicetify.LocalStorage.get(VERBOSE_DEBUG_KEY_LEGACY);
+  if (legacy !== null) {
+    setBoolSetting(DRY_RUN_KEY, legacy === "true");
+    return;
+  }
+  setBoolSetting(DRY_RUN_KEY, false);
 }
 
 function initialize(): void {
   if (Spicetify.LocalStorage.get(ENABLED_KEY) === null) {
-    setBoolSetting(ENABLED_KEY, true);
+    setBoolSetting(ENABLED_KEY, false);
   }
-  if (Spicetify.LocalStorage.get(VERBOSE_DEBUG_KEY) === null) {
-    setBoolSetting(VERBOSE_DEBUG_KEY, VERBOSE_DEBUG_DEFAULT);
-  }
+  migrateDryRunSetting();
 
   setupMenu();
   updateMenuState();
